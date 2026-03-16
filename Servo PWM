@@ -1,0 +1,92 @@
+void setup() {
+  // ดึง pin LOW ก่อน attach - ป้องกัน servo กระตุกตอนบูท
+  pinMode(SERVO1_PIN, OUTPUT);    
+  digitalWrite(SERVO1_PIN,LOW);
+  pinMode(SERVO2_PIN, OUTPUT);    
+  digitalWrite(SERVO2_PIN,LOW);
+  delay(300);
+  
+  // attach Servo ตามลำดับ
+  servo1.setPeriodHertz(50);
+  servo1.attach(SERVO1_PIN, 500, 2400);
+  servo1.writeMicroseconds(degToUs(90)); // ตั้งตำแหน่งเริ่มต้น servo1
+
+  servo2.setPeriodHertz(50);
+  servo2.attach(SERVO2_PIN, 500, 2400);
+  servo2.writeMicroseconds(degToUs(90)); // ตั้งตำแหน่งเริ่มต้น servo2
+
+}
+void startCleaning() {
+
+  isCleaning = true;
+
+  lcd.clear();
+  lcd.print("1: SERVO TO 160");
+  
+  // SERVO TO 160
+  for (int i=0; i<5; i++) {
+  servo1.writeMicroseconds(degToUs(160));
+  servo2.writeMicroseconds(degToUs(160));
+  delay(300);
+  }
+
+  catSafetyDelay(800);
+
+  lcd.clear();
+  lcd.print("2: MOVING FWD");
+
+  runMotorSafe(1000, true);
+
+  lcd.clear();
+  lcd.print("3: RESET TO 90");
+
+  // RESET TO 90
+  for (int i=0; i<5; i++) {
+  servo1.writeMicroseconds(degToUs(90));
+  servo2.writeMicroseconds(degToUs(90));
+  delay(300);
+  }
+
+  catSafetyDelay(800);
+
+  lcd.clear();
+  lcd.print("4: MOVING BWD");
+
+  runMotorSafe(1000, false);
+
+  lcd.clear();
+  lcd.print("5: SERVO TO 20");
+  
+  // SERVO TO 20
+  servo1.writeMicroseconds(degToUs(20));
+  servo2.writeMicroseconds(degToUs(20));
+
+  catSafetyDelay(800);
+
+  lcd.clear();
+  lcd.print("6: RESET TO 90");
+
+  // RESET TO 90
+  for (int i=0; i<5; i++) {
+  servo1.writeMicroseconds(degToUs(90));
+  servo2.writeMicroseconds(degToUs(90));
+  delay(300);
+  }
+
+  catSafetyDelay(800);
+
+  lcd.clear();
+  lcd.print("   COMPLETE   ");
+
+  delay(2000);
+
+  lcd.clear();
+  lcd.print("READY (90 DEG)");
+
+  isCleaning = false;
+}
+
+// แปลงองศา
+int degToUs(int deg) {
+  return map(constrain(deg,0,180), 0, 180, 500, 2400);
+}
