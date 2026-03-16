@@ -1,0 +1,216 @@
+import io
+import os
+import time
+import cv2
+import numpy as np
+import ssl
+import paho.mqtt.client as mqtt
+
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.oauth2.credentials import Credentials
+
+
+# ======================
+# MQTT CONFIG (HiveMQ Cloud)
+# ======================
+
+MQTT_BROKER = "0cdfbe4d61c64fe1b0be3b7d9a2199c4.s1.eu.hivemq.cloud"
+MQTT_PORT = 8883
+MQTT_TOPIC = "Check/dirty"
+
+MQTT_USERNAME = "hivemq.webclient.1773126302224"
+MQTT_PASSWORD = "o?MBiR2fv&D.,e6P3lQ7"
+
+mqtt_client = mqtt.Client()
+
+mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+
+# TLS required for HiveMQ Cloud
+mqtt_client.tls_set(cert_reqs=ssl.CERT_NONE)
+mqtt_client.tls_insecure_set(True)
+
+print("Connecting to MQTT...")
+
+mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+
+mqtt_client.loop_start()
+
+print("MQTT Connected")
+
+
+# ======================
+# GOOGLE DRIVE CONFIG
+# ======================
+
+SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
+
+AUTO_FOLDER = "1ORdBI7KkmQfVi0XNaSrg_P4V2GCOm_XZ"
+MANUAL_FOLDER = "1fzdquK755-wLgWtjpoC-jnpn5go-LsLi"
+
+FOLDERS = {
+    "AUTO": AUTO_FOLDER,
+    "MANUAL": MANUAL_FOLDER
+}
+
+creds = None
+
+if os.path.exists("token.json"):
+    creds = Credentials.from_authorized_user_file("token.json", SCOPES)
+
+if not creds:
+    flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
+    creds = flow.run_local_server(port=0)
+
+    with open("token.json", "w") as token:
+        token.write(creds.to_json())
+
+service = build("drive", "v3", credentials=creds)
+
+
+# ======================
+# VARIABLES
+# ======================
+
+last_file_ids = {
+    "AUTO": None,
+    "MANUAL": None
+}
+
+auto_img = None
+manual_img = None
+
+last_result = None
+
+
+# ======================
+# FUNCTIONS
+# ======================
+
+def get_latest_subfolder(parent_id):
+
+    results = service.files().list(
+        q=f"'{parent_id}' in parents and mimeType='application/vnd.google-apps.folder'",
+        orderBy="createdTime desc",
+        pageSize=1,
+        fields="files(id,name)"
+    ).execute()
+
+    folders = results.get("files", [])
+
+    if not folders:
+        return None
+
+    return folders[0]["id"]
+
+
+def get_latest_image(folder_id):
+
+    results = service.files().list(
+        q=f"'{folder_id}' in parents and mimeType contains 'image/'",
+        orderBy="createdTime desc",
+        pageSize=1,
+        fields="files(id,name)"
+    ).execute()
+
+    files = results.get("files", [])
+
+    if not files:
+        return None
+
+    return files[0]
+
+
+print("เริ่มตรวจสอบ Drive")
+
+
+# ======================
+# MAIN LOOP
+# ======================
+
+while True:
+
+    updated = False
+
+    for name, folder_id in FOLDERS.items():
+
+        try:
+
+            latest_subfolder = get_latest_subfolder(folder_id)
+
+            if not latest_subfolder:
+                continue
+
+            file = get_latest_image(latest_subfolder)
+
+            if not file:
+                continue
+
+            if file["id"] != last_file_ids[name]:
+
+                print(f"พบรูปใหม่ {name}: {file['name']}")
+
+                last_file_ids[name] = file["id"]
+                updated = True
+
+                request = service.files().get_media(fileId=file["id"])
+                fh = io.BytesIO()
+
+                downloader = MediaIoBaseDownload(fh, request)
+
+                done = False
+                while not done:
+                    status, done = downloader.next_chunk()
+
+                img_array = np.frombuffer(fh.getvalue(), np.uint8)
+                img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+
+                if img is None:
+                    continue
+
+                if name == "AUTO":
+                    auto_img = img
+
+                if name == "MANUAL":
+                    manual_img = img
+
+            # ======================
+            # COMPARE IMAGE
+            # ======================
+
+            if updated and auto_img is not None and manual_img is not None:
+
+                manual_resized = cv2.resize(
+                    manual_img,
+                    (auto_img.shape[1], auto_img.shape[0])
+                )
+
+                diff = cv2.absdiff(auto_img, manual_resized)
+
+                gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+
+                _, thresh = cv2.threshold(gray, 25, 255, cv2.THRESH_BINARY)
+
+                change_pixels = np.sum(thresh > 0)
+
+                if change_pixels > 500:
+                    result = "different"
+                else:
+                    result = "same"
+
+                print("RESULT:", result)
+
+                # ======================
+                # MQTT PUBLISH
+                # ======================
+
+                if result != last_result:
+                    mqtt_client.publish(MQTT_TOPIC, result)
+                    print("MQTT Publish:", result)
+                    last_result = result
+
+        except Exception as e:
+            print("Error:", e)
+
+    time.sleep(5)
