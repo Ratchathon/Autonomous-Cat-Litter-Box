@@ -1,0 +1,629 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <ESP32Servo.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+
+
+// =========================
+// MQTT
+// =========================
+const char* mqtt_server = "0cdfbe4d61c64fe1b0be3b7d9a2199c4.s1.eu.hivemq.cloud";
+const char mqtt_topic[]="cam32/Cap";
+const char mqtt_topic1[]="Check/dirty";
+const char mqtt_client_id[]="Nut";
+const int mqtt_port = 8880;
+
+WiFiClientSecure espClient;
+PubSubClient client(espClient);
+
+const char* mqtt_user = "hivemq.webclient.1773755964982";
+const char* mqtt_pass = "1;4Rwk2:P9ad$ETOZ.rb";
+// =========================
+// I2C
+// =========================
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// =========================
+// WiFi
+// =========================
+const char* WIFI_SSID = "Wifi_Name";
+const char* WIFI_PASS = "Wifi_Password";
+
+// =========================
+// Google Apps Script
+// =========================
+const char* APPS_SCRIPT_URL =
+"https://script.google.com/macros/s/AKfycbyxvlScbhmziDAQQ8mJqHEoRzG8S0_dYowFPN0xq1kf6jDXADrQmEEu49rV9f_iwBEo/exec";
+
+WebServer server(80);
+
+void connectMQTT() {
+
+  while (!client.connected()) {
+
+    Serial.print("Connecting MQTT...");
+
+    if (client.connect(mqtt_client_id, mqtt_user, mqtt_pass)) {
+
+      Serial.println("connected");
+
+      client.subscribe(mqtt_topic); // รับคำสั่งจาก cam
+
+    } else {
+
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      delay(2000);
+    }
+  }
+}
+
+void callback(char* topic, byte* payload, unsigned int length) {
+
+  String msg;
+
+  for (int i = 0; i < length; i++) {
+    msg += (char)payload[i];
+  }
+
+  Serial.print("Message: ");
+  Serial.println(msg);
+
+  if (msg == "capture") {
+    Serial.println("Trigger CAM");
+  }
+
+  if (msg == "dirty") {
+    Serial.println("Dirty detected -> cleaning again");
+    startCleaning();
+  }
+}
+
+// =========================
+// พินมอเตอร์ L298N
+// =========================
+const int IN1 = 5;
+const int IN2 = 17;
+const int IN3 = 18;
+const int IN4 = 19;
+
+int motorSpeed = 220;
+
+// =========================
+// พินอุปกรณ์
+// =========================
+Servo servo1;
+Servo servo2;
+
+const int pinS1 = 14;
+const int pinS2 = 16;
+
+const int sensorInside = 26;
+const int sensorEntry  = 33;
+
+// =========================
+// สถานะระบบ
+// =========================
+bool isCleaning = false;
+bool webStartRequested = false;
+
+// =========================
+// poll Apps Script
+// =========================
+unsigned long lastPoll = 0;
+const unsigned long pollInterval = 3000;
+
+// =========================
+// MQTT
+// =========================
+
+// =========================
+// CORS
+// =========================
+void sendCorsHeaders() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
+void handleOptions() {
+  sendCorsHeaders();
+  server.send(204);
+}
+
+// =========================
+// STOP MOTOR
+// =========================
+void stopDC() {
+
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+
+  analogWrite(IN1, 0);
+  analogWrite(IN2, 0);
+  analogWrite(IN3, 0);
+  analogWrite(IN4, 0);
+}
+
+// =========================
+// SAFETY SENSOR
+// =========================
+volatile bool catDetected = false;
+
+void IRAM_ATTR catInterrupt() {
+  catDetected = true;
+}
+
+bool isCatIn() {
+
+  if (catDetected) {
+
+    stopDC();
+
+    lcd.setCursor(0,1);
+    lcd.print("!!! PAUSED !!! ");
+
+    return true;
+  }
+
+  return false;
+}
+
+// =========================
+// delay with sensor check
+// =========================
+void catSafetyDelay(unsigned long ms) {
+
+  unsigned long start = millis();
+
+  while (millis() - start < ms) {
+
+    server.handleClient();
+
+    if (isCatIn()) {
+
+      while (digitalRead(sensorEntry) == LOW || digitalRead(sensorInside) == LOW) {
+
+        server.handleClient();
+        delay(100);
+
+      }
+
+      lcd.setCursor(0,1);
+      lcd.print("Resuming...    ");
+      delay(1000);
+      lcd.setCursor(0,1);
+      lcd.print("                ");
+    }
+
+    delay(10);
+  }
+}
+
+// =========================
+// MOTOR CONTROL
+// =========================
+void runMotorSafe(unsigned long duration, bool forward) {
+
+  unsigned long startT = millis();
+  unsigned long elapsed = 0;
+
+  while (elapsed < duration) {
+
+    server.handleClient();
+
+    if (isCatIn()) {
+
+      while (digitalRead(sensorEntry) == LOW || digitalRead(sensorInside) == LOW) {
+        server.handleClient();
+        delay(100);
+      }
+
+      delay(1000);
+
+      startT = millis() - elapsed;
+    }
+
+    if (forward) {
+
+      analogWrite(IN1, motorSpeed);
+      digitalWrite(IN2, LOW);
+
+      analogWrite(IN3, motorSpeed);
+      digitalWrite(IN4, LOW);
+
+    }
+    else {
+
+      digitalWrite(IN1, LOW);
+      analogWrite(IN2, motorSpeed);
+
+      digitalWrite(IN3, LOW);
+      analogWrite(IN4, motorSpeed);
+
+    }
+
+    elapsed = millis() - startT;
+    delay(10);
+  }
+
+  stopDC();
+}
+
+int degToUs(int deg) {
+  return map(constrain(deg,0,180), 0, 180, 500, 2400);
+}
+// =========================
+// CLEANING
+// =========================
+void startCleaning() {
+
+  isCleaning = true;
+
+  lcd.clear();
+  lcd.print("1: SERVO TO 160");
+
+  servo1.writeMicroseconds(degToUs(160));
+  servo2.writeMicroseconds(degToUs(160));
+
+  catSafetyDelay(800);
+
+  lcd.clear();
+  lcd.print("2: MOVING FWD");
+
+  runMotorSafe(1000, true);
+
+  lcd.clear();
+  lcd.print("3: RESET TO 90");
+
+  servo1.writeMicroseconds(degToUs(90));
+  servo2.writeMicroseconds(degToUs(90));
+
+  catSafetyDelay(800);
+
+  lcd.clear();
+  lcd.print("4: MOVING BWD");
+
+  runMotorSafe(1000, false);
+
+  lcd.clear();
+  lcd.print("5: SERVO TO 20");
+
+  servo1.writeMicroseconds(degToUs(20));
+  servo2.writeMicroseconds(degToUs(160));
+
+  catSafetyDelay(800);
+
+  lcd.clear();
+  lcd.print("6: RESET TO 90");
+
+  servo1.writeMicroseconds(degToUs(90));
+  servo2.writeMicroseconds(degToUs(90));
+
+  catSafetyDelay(800);
+
+  lcd.clear();
+  lcd.print("   COMPLETE   ");
+
+  delay(2000);
+
+  lcd.clear();
+  lcd.print("READY (90 DEG)");
+
+  isCleaning = false;
+}
+// =========================
+// WEB
+// =========================
+void handleRoot() {
+
+  sendCorsHeaders();
+
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ESP32 Cat Toilet</title>
+</head>
+<body style="font-family:Arial;padding:20px;">
+<h2>ESP32 Cat Toilet</h2>
+<p>Device Ready</p>
+<p><a href="/status">/status</a></p>
+<p><a href="/start">/start</a></p>
+</body>
+</html>
+)rawliteral";
+
+  server.send(200,"text/html",html);
+}
+
+// =========================
+// STATUS JSON
+// =========================
+void handleStatus() {
+
+  sendCorsHeaders();
+
+  String json = "{";
+
+  json += "\"ok\":true,";
+  json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+  json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
+  json += "\"cleaning\":" + String(isCleaning ? "true":"false") + ",";
+  json += "\"sensorInside\":" + String(digitalRead(sensorInside)==LOW ? "true":"false") + ",";
+  json += "\"sensorEntry\":" + String(digitalRead(sensorEntry)==LOW ? "true":"false");
+
+  json += "}";
+
+  server.send(200,"application/json",json);
+}
+
+// =========================
+// START CLEAN
+// =========================
+void handleStart() {
+
+  sendCorsHeaders();
+
+  if(isCleaning){
+
+    server.send(200,"application/json",
+    "{\"ok\":false,\"message\":\"already_cleaning\"}");
+
+    return;
+  }
+
+  webStartRequested = true;
+
+  server.send(200,"application/json",
+  "{\"ok\":true,\"message\":\"cleaning_requested\"}");
+}
+
+// =========================
+// NOT FOUND
+// =========================
+void handleNotFound(){
+
+  sendCorsHeaders();
+
+  server.send(404,"application/json",
+  "{\"ok\":false,\"message\":\"not_found\"}");
+}
+
+// =========================
+// WIFI
+// =========================
+void connectWiFi(){
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID,WIFI_PASS);
+
+  lcd.clear();
+  lcd.print("CONNECT WIFI...");
+
+  Serial.print("Connecting");
+
+  unsigned long start = millis();
+
+  while(WiFi.status()!=WL_CONNECTED && millis()-start<20000){
+
+    Serial.print(".");
+    delay(500);
+  }
+
+  Serial.println();
+
+  if(WiFi.status()==WL_CONNECTED){
+
+    Serial.println("WiFi connected");
+    Serial.println(WiFi.localIP());
+
+    lcd.clear();
+    lcd.print("WIFI OK");
+
+    lcd.setCursor(0,1);
+    lcd.print(WiFi.localIP().toString());
+
+    delay(2000);
+
+  }
+  else{
+
+    lcd.clear();
+    lcd.print("WIFI FAILED");
+
+    delay(2000);
+  }
+}
+
+// =========================
+// JSON command parser
+// =========================
+String extractCommand(String payload){
+
+  int keyPos = payload.indexOf("\"command\":\"");
+
+  if(keyPos<0) return "";
+
+  int start = keyPos + 11;
+
+  int end = payload.indexOf("\"",start);
+
+  if(end<0) return "";
+
+  return payload.substring(start,end);
+}
+
+// =========================
+// HTTP GET
+// =========================
+String httpGetString(String url,int &httpCode){
+
+  HTTPClient http;
+
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.begin(url);
+
+  httpCode = http.GET();
+
+  String payload="";
+
+  if(httpCode>0){
+    payload = http.getString();
+  }
+
+  http.end();
+
+  return payload;
+}
+
+// =========================
+// POLL COMMAND
+// =========================
+void pollCommandFromServer(){
+
+  if(WiFi.status()!=WL_CONNECTED) return;
+  if(isCleaning) return;
+
+  int httpCode = 0;
+
+  String getUrl = String(APPS_SCRIPT_URL) + "?action=getCommand";
+
+  String payload = httpGetString(getUrl,httpCode);
+
+  if(httpCode != 200){
+    Serial.println("Poll failed");
+    return;
+  }
+
+  String cmd = extractCommand(payload);
+
+  if(cmd == "") return;
+
+  Serial.print("CMD: ");
+  Serial.println(cmd);
+
+  if(cmd == "start"){
+
+    Serial.println("START COMMAND");
+
+    int clearCode = 0;
+    String clearUrl = String(APPS_SCRIPT_URL) + "?action=clearCommand";
+    httpGetString(clearUrl,clearCode);
+
+    lcd.clear();
+    lcd.print("CMD: START");
+
+    delay(500);
+
+    startCleaning();
+  }
+}
+// =========================
+// SETUP
+// =========================
+void setup(){
+
+  Serial.begin(115200);
+
+  Wire.begin(21,22);
+
+  lcd.init();
+  lcd.backlight();
+
+  lcd.print("SYSTEM STARTING");
+
+  //-------------------------------------------------//
+  pinMode(IN1,OUTPUT);
+  pinMode(IN2,OUTPUT);
+  pinMode(IN3,OUTPUT);
+  pinMode(IN4,OUTPUT);
+
+  pinMode(sensorEntry,INPUT_PULLUP);
+  pinMode(sensorInside,INPUT_PULLUP);
+  //-------------------------------------------------//
+  servo1.attach(pinS1);
+  servo2.attach(pinS2);
+
+  servo1.write(90);
+  servo2.write(90);
+  //-------------------------------------------------//
+  pinMode(sensorEntry, INPUT_PULLUP);
+  pinMode(sensorInside, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(sensorEntry), catInterrupt, FALLING);
+  attachInterrupt(digitalPinToInterrupt(sensorInside), catInterrupt, FALLING);
+  //-------------------------------------------------//
+  stopDC();
+
+  connectWiFi();
+
+  server.on("/",HTTP_GET,handleRoot);
+  server.on("/status",HTTP_GET,handleStatus);
+  server.on("/start",HTTP_GET,handleStart);
+
+  espClient.setInsecure(); // ใช้ TLS แบบง่าย (HiveMQ)
+  client.setServer(mqtt_server, 8883); // ใช้ port TLS
+  client.setCallback(callback);
+
+  server.onNotFound(handleNotFound);
+
+  server.begin();
+
+  lcd.clear();
+  lcd.print("READY (90 DEG)");
+}
+
+// =========================
+// LOOP
+// =========================
+void loop(){
+
+  server.handleClient();
+
+  if (!client.connected()) {
+  connectMQTT();
+  }
+  client.loop();
+
+
+  if(webStartRequested && !isCleaning){
+
+    webStartRequested=false;
+
+    startCleaning();
+  }
+
+  if(millis()-lastPoll>=pollInterval){
+
+    lastPoll=millis();
+
+    pollCommandFromServer();
+  }
+
+  if(!isCleaning && digitalRead(sensorInside)==LOW){
+
+    lcd.clear();
+    lcd.print("CAT DETECTED");
+
+    while(digitalRead(sensorInside)==LOW || digitalRead(sensorEntry)==LOW){
+
+      server.handleClient();
+      delay(200);
+    }
+
+    lcd.clear();
+    lcd.print("CLEANING IN 3S");
+
+    catSafetyDelay(3000);
+
+    startCleaning();
+  }
+}
